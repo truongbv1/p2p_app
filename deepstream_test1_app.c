@@ -23,7 +23,11 @@
 #include <gst/gst.h>
 #include <glib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include "gstnvdsmeta.h"
+//for camera
+#include "ip_cam.h"
+#include "simple_cache.h"
 
 #define MAX_DISPLAY_LEN 64
 
@@ -44,13 +48,35 @@ gint frame_number = 0;
 gchar pgie_classes_str[4][32] = { "Vehicle", "TwoWheeler", "Person",
   "Roadsign"
 };
+// APP_Source
+AppSrcData* mAppSrcData;
+// End APP_Source
+
+#ifdef ENABLE_RECORDING
+FILE *vRawIn;
+//~ FILE *vRawOut;
+#endif
+
+static gboolean forceStop = FALSE;
+
+static void sighandler(int signum)
+{
+	/*close files*/
+#ifdef ENABLE_RECORDING
+	fclose(vRawIn);
+	//~ fclose(vRawOut);
+#endif
+    g_print ("sighandler: %d\n", signum);
+    forceStop = TRUE;
+    // gst_app_src_end_of_stream ((GstAppSrc *) mAppSrcData->app_source);
+    g_main_loop_quit (mAppSrcData->loop);
+}
 
 /* osd_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
  * and update params for drawing rectangle, object information etc. */
 
 static GstPadProbeReturn
-osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
-    gpointer u_data)
+osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer u_data)
 {
     GstBuffer *buf = (GstBuffer *) info->data;
     guint num_rects = 0; 
@@ -82,7 +108,7 @@ osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
         display_meta = nvds_acquire_display_meta_from_pool(batch_meta);
         NvOSD_TextParams *txt_params  = &display_meta->text_params[0];
         display_meta->num_labels = 1;
-        txt_params->display_text = g_malloc0 (MAX_DISPLAY_LEN);
+        txt_params->display_text = (char*)g_malloc0 (MAX_DISPLAY_LEN);
         offset = snprintf(txt_params->display_text, MAX_DISPLAY_LEN, "Person = %d ", person_count);
         offset = snprintf(txt_params->display_text + offset , MAX_DISPLAY_LEN, "Vehicle = %d ", vehicle_count);
 
@@ -91,7 +117,7 @@ osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
         txt_params->y_offset = 12;
 
         /* Font , font-color and font-size */
-        txt_params->font_params.font_name = "Serif";
+        txt_params->font_params.font_name = (char*)"Serif";
         txt_params->font_params.font_size = 10;
         txt_params->font_params.font_color.red = 1.0;
         txt_params->font_params.font_color.green = 1.0;
@@ -108,9 +134,9 @@ osd_sink_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
         nvds_add_display_meta_to_frame(frame_meta, display_meta);
     }
 
-    g_print ("Frame Number = %d Number of objects = %d "
-            "Vehicle Count = %d Person Count = %d\n",
-            frame_number, num_rects, vehicle_count, person_count);
+    //~ g_print ("Frame Number = %d Number of objects = %d "
+            //~ "Vehicle Count = %d Person Count = %d\n",
+            //~ frame_number, num_rects, vehicle_count, person_count);
     frame_number++;
     return GST_PAD_PROBE_OK;
 }
@@ -121,8 +147,10 @@ bus_call (GstBus * bus, GstMessage * msg, gpointer data)
   GMainLoop *loop = (GMainLoop *) data;
   switch (GST_MESSAGE_TYPE (msg)) {
     case GST_MESSAGE_EOS:
-      g_print ("End of stream\n");
-      g_main_loop_quit (loop);
+      if(forceStop) {
+        g_print ("End of stream\n");
+        g_main_loop_quit (loop);
+      }
       break;
     case GST_MESSAGE_ERROR:{
       gchar *debug;
@@ -143,50 +171,130 @@ bus_call (GstBus * bus, GstMessage * msg, gpointer data)
   return TRUE;
 }
 
+// For camera
+#ifdef IP_CAM_INPUT
+static void search_device_cb(KHJ::searchDeviceInfo *info, int count)
+{
+	g_print("----Search------%d\n", count);
+	for (int i = 0; i < count; ++i)
+		g_print("Search %s\n", info[i].UID);
+	g_print("----Search------%d\n", count);
+}
+
+static void video_recv_cb(char *buffer, int size, uint64_t pts, bool is_key)
+{
+	//~ g_print("video: %p %d %ld %d\n", buffer, size, pts, is_key);
+    //~ g_print("mAppSrcData->cache: %p\n", mAppSrcData->cache);
+#ifdef ENABLE_RECORDING
+    fwrite (buffer , sizeof(char), size, vRawIn);
+#endif
+    simple_cache_write(mAppSrcData->cache, buffer, size);
+}
+
+static void connect_cb(std::shared_ptr<KHJ::CameraBase> c, int status)
+{
+    g_print("connect_cb: UID: %s, status=%d\n", c->getUID().c_str(), status);
+    mAppSrcData->cam_status = status;
+	if (0 == status) {
+		g_print("Connect success...recv video...\n");
+#ifdef ENABLE_RECORDING
+        vRawIn = fopen("videoraw.h265", "wb");
+#endif
+        mAppSrcData->is_offline = FALSE;
+		c->startRecvVideo(true, video_recv_cb);
+	}
+}
+
+static void offline_cb(std::shared_ptr<KHJ::CameraBase> c)
+{
+    g_print("offline_cb: [UID: %s]\n", c->getUID().c_str());
+    mAppSrcData->is_offline = TRUE;
+}
+#endif // IP_CAM_INPUT
+// end Camera
+
 int
 main (int argc, char *argv[])
 {
-  GMainLoop *loop = NULL;
-  GstElement *pipeline = NULL, *source = NULL, *h264parser = NULL,
+  signal(SIGINT, sighandler);
+
+  GstElement *pipeline = NULL, *source = NULL, *h265parser = NULL,
       *decoder = NULL, *streammux = NULL, *sink = NULL, *pgie = NULL, *nvvidconv = NULL,
       *nvosd = NULL;
-#ifdef PLATFORM_TEGRA
   GstElement *transform = NULL;
-#endif
   GstBus *bus = NULL;
   guint bus_watch_id;
   GstPad *osd_sink_pad = NULL;
+  gboolean add_bus_watch_id = FALSE;
+
+  GstPad *sinkpad, *srcpad;
+  gchar pad_name_sink[16] = "sink_0";
+  gchar pad_name_src[16] = "src";
 
   /* Check input arguments */
-  if (argc != 2) {
-    g_printerr ("Usage: %s <H264 filename>\n", argv[0]);
+  if (argc != 3) {
+#ifdef IP_CAM_INPUT
+    g_printerr ("Usage: %s <Camera UUID> <Config filename>\n", argv[0]);
+#else
+    g_printerr ("Usage: %s <H265 filename> <Config filename>\n", argv[0]);
+#endif
     return -1;
   }
-
+  // APP_Source
+  guint cache_size_max = 1024*1024*10; //10M
+  mAppSrcData = ip_cam_init_source(cache_size_max);
+  if(mAppSrcData == NULL) {
+    g_printerr("Can not init App Source\n");
+    return -1;
+  }
   /* Standard GStreamer initialization */
   gst_init (&argc, &argv);
-  loop = g_main_loop_new (NULL, FALSE);
-
+  mAppSrcData->loop = g_main_loop_new (NULL, FALSE);
+start_app:
+  add_bus_watch_id = FALSE;
+#ifdef IP_CAM_INPUT
+  std::shared_ptr<KHJ::CameraBase> camera = nullptr;
+  while(camera == nullptr){
+      if(forceStop){
+        goto out;
+      }
+      camera = ip_cam_connect(mAppSrcData, std::string(argv[1]), "admin", "888888", search_device_cb, connect_cb, offline_cb);
+      if(camera ==  nullptr){
+        g_printerr ("Can not connect camera. Retry after 30 seconds\n");
+        sleep(30);
+      }
+  }
+#else
+  mAppSrcData->file = fopen (argv[1], "r");
+#endif
   /* Create gstreamer elements */
   /* Create Pipeline element that will form a connection of other elements */
-  pipeline = gst_pipeline_new ("dstest1-pipeline");
+  pipeline = gst_pipeline_new ("dstest-appsrc-pipeline");
+  if (!pipeline) {
+    g_printerr ("Pipeline could not be created. Exiting.\n");
+    goto disconnect_cam; // free GMainLoop and disconnect Camera
+  }
 
-  /* Source element for reading from the file */
-  source = gst_element_factory_make ("filesrc", "file-source");
+  /* App Source element for reading from raw video file */
+  mAppSrcData->app_source = gst_element_factory_make ("appsrc", "app-source");
+  if (!mAppSrcData->app_source) {
+    g_printerr ("Appsrc element could not be created. Exiting.\n");
+    goto disconnect_cam;
+  }
 
-  /* Since the data format in the input file is elementary h264 stream,
-   * we need a h264parser */
-  h264parser = gst_element_factory_make ("h264parse", "h264-parser");
+  /* Since the data format in the input file is elementary h265 stream,
+   * we need a h265parser */
+  h265parser = gst_element_factory_make ("h265parse", "h265-parser");
 
-  /* Use nvdec_h264 for hardware accelerated decode on GPU */
+  /* Use nvdec_h265 for hardware accelerated decode on GPU */
   decoder = gst_element_factory_make ("nvv4l2decoder", "nvv4l2-decoder");
 
   /* Create nvstreammux instance to form batches from one or more sources. */
   streammux = gst_element_factory_make ("nvstreammux", "stream-muxer");
 
-  if (!pipeline || !streammux) {
+  if (!streammux) {
     g_printerr ("One element could not be created. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
 
   /* Use nvinfer to run inferencing on decoder's output,
@@ -200,26 +308,31 @@ main (int argc, char *argv[])
   nvosd = gst_element_factory_make ("nvdsosd", "nv-onscreendisplay");
 
   /* Finally render the osd output */
-#ifdef PLATFORM_TEGRA
   transform = gst_element_factory_make ("nvegltransform", "nvegl-transform");
-#endif
   sink = gst_element_factory_make ("nveglglessink", "nvvideo-renderer");
 
-  if (!source || !h264parser || !decoder || !pgie
+  if (!h265parser || !decoder || !pgie
       || !nvvidconv || !nvosd || !sink) {
     g_printerr ("One element could not be created. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
 
-#ifdef PLATFORM_TEGRA
   if(!transform) {
     g_printerr ("One tegra element could not be created. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
-#endif
 
-  /* we set the input filename to the source element */
-  g_object_set (G_OBJECT (source), "location", argv[1], NULL);
+  /* APP_Source
+   * Configure APP SOurce */
+  g_object_set (mAppSrcData->app_source, "caps",
+      gst_caps_new_simple ("video/x-h265",
+          "format", G_TYPE_STRING, "byte-stream", NULL), NULL);
+          
+  g_signal_connect (mAppSrcData->app_source, "need-data", G_CALLBACK (start_feed),
+      mAppSrcData);
+  g_signal_connect (mAppSrcData->app_source, "enough-data", G_CALLBACK (stop_feed),
+      mAppSrcData);
+  /* End APP_Source */
 
   g_object_set (G_OBJECT (streammux), "batch-size", 1, NULL);
 
@@ -230,71 +343,54 @@ main (int argc, char *argv[])
   /* Set all the necessary properties of the nvinfer element,
    * the necessary ones are : */
   g_object_set (G_OBJECT (pgie),
-      "config-file-path", "dstest1_pgie_config.txt", NULL);
+      "config-file-path", argv[2], NULL);
 
   /* we add a message handler */
   bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
-  bus_watch_id = gst_bus_add_watch (bus, bus_call, loop);
+  bus_watch_id = gst_bus_add_watch (bus, bus_call, mAppSrcData->loop);
+  add_bus_watch_id = TRUE;
   gst_object_unref (bus);
 
   /* Set up the pipeline */
   /* we add all elements into the pipeline */
-#ifdef PLATFORM_TEGRA
   gst_bin_add_many (GST_BIN (pipeline),
-      source, h264parser, decoder, streammux, pgie,
+      mAppSrcData->app_source, h265parser, decoder, streammux, pgie,
       nvvidconv, nvosd, transform, sink, NULL);
-#else
-  gst_bin_add_many (GST_BIN (pipeline),
-      source, h264parser, decoder, streammux, pgie,
-      nvvidconv, nvosd, sink, NULL);
-#endif
-
-  GstPad *sinkpad, *srcpad;
-  gchar pad_name_sink[16] = "sink_0";
-  gchar pad_name_src[16] = "src";
 
   sinkpad = gst_element_get_request_pad (streammux, pad_name_sink);
   if (!sinkpad) {
     g_printerr ("Streammux request sink pad failed. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
 
   srcpad = gst_element_get_static_pad (decoder, pad_name_src);
   if (!srcpad) {
     g_printerr ("Decoder request src pad failed. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
 
   if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
       g_printerr ("Failed to link decoder to stream muxer. Exiting.\n");
-      return -1;
+      goto stop_playback;
   }
 
   gst_object_unref (sinkpad);
   gst_object_unref (srcpad);
 
   /* we link the elements together */
-  /* file-source -> h264-parser -> nvh264-decoder ->
+  /* app-source -> h265-parser -> nvh265-decoder ->
    * nvinfer -> nvvidconv -> nvosd -> video-renderer */
 
-  if (!gst_element_link_many (source, h264parser, decoder, NULL)) {
+  if (!gst_element_link_many (mAppSrcData->app_source, h265parser, decoder, NULL)) {
     g_printerr ("Elements could not be linked: 1. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
 
-#ifdef PLATFORM_TEGRA
   if (!gst_element_link_many (streammux, pgie,
       nvvidconv, nvosd, transform, sink, NULL)) {
     g_printerr ("Elements could not be linked: 2. Exiting.\n");
-    return -1;
+    goto stop_playback;
   }
-#else
-  if (!gst_element_link_many (streammux, pgie,
-      nvvidconv, nvosd, sink, NULL)) {
-    g_printerr ("Elements could not be linked: 2. Exiting.\n");
-    return -1;
-  }
-#endif
 
   /* Lets add probe to get informed of the meta data generated, we add probe to
    * the sink pad of the osd element, since by that time, the buffer would have
@@ -313,14 +409,28 @@ main (int argc, char *argv[])
 
   /* Wait till pipeline encounters an error or EOS */
   g_print ("Running...\n");
-  g_main_loop_run (loop);
+  g_main_loop_run (mAppSrcData->loop);
 
+stop_playback:
   /* Out of the main loop, clean up nicely */
   g_print ("Returned, stopping playback\n");
   gst_element_set_state (pipeline, GST_STATE_NULL);
   g_print ("Deleting pipeline\n");
   gst_object_unref (GST_OBJECT (pipeline));
-  g_source_remove (bus_watch_id);
-  g_main_loop_unref (loop);
+  if(add_bus_watch_id) {
+    g_print ("Deleting bus watch\n");
+    g_source_remove (bus_watch_id);
+  }
+
+disconnect_cam:
+#ifdef IP_CAM_INPUT
+  ip_cam_disconnect(camera);
+#endif
+  /* restart service if the network has any issue and it is not receive stop command from main controller */
+  if(!forceStop)
+    goto start_app;
+out:
+  g_main_loop_unref (mAppSrcData->loop);
+  ip_cam_free_source(mAppSrcData);
   return 0;
 }
